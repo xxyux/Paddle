@@ -66,6 +66,7 @@ class MLAInfo:
 
     param_name: str
     head_num: int
+    head_split_sizes: list[int] | None = None
 
 
 @dataclass
@@ -574,13 +575,18 @@ class Muon(Optimizer):
         head_num,
         ortho_fn,
         axis,
+        head_split_sizes=None,
     ):
         """Orthogonalise each MLA head independently."""
-        groups = paddle.split(matrix_2d_global, head_num, axis=axis)
+        split_args = (
+            head_num
+            if head_split_sizes is None
+            else head_split_sizes * head_num
+        )
 
-        processed_groups = []
-        for group in groups:
-            processed_groups.append(ortho_fn(group))
+        groups = paddle.split(matrix_2d_global, split_args, axis=axis)
+
+        processed_groups = [ortho_fn(group) for group in groups]
 
         return paddle.concat(processed_groups, axis=axis)
 
@@ -766,26 +772,33 @@ class Muon(Optimizer):
                         ortho_fn,
                     )
             elif is_mla and self._muon_qkv_update_mode == "split_head":
-                # MLA split_head update: each head of [q_b_proj, kv_b_proj, o_proj] orthogonalised independently.
+                # MLA split_head update: each head of [q_b_proj, kv_a_proj, kv_b_proj, o_proj] orthogonalised independently.
                 mla_info = param_info.mla_info
                 param_name: str = mla_info.param_name
                 head_num = mla_info.head_num
+                head_split_sizes = mla_info.head_split_sizes
+
                 if MUON_DEBUG:
                     _global_rank = paddle.distributed.get_rank()
                     if _global_rank == 0:
                         _logger.info(
                             f"[Muon] MLA split_head: param={param.name}, param_name={param_name}, "
                             f"shape={matrix_2d_global.shape}, "
-                            f"head_num={head_num}"
+                            f"head_num={head_num}, "
+                            f"head_split_sizes={head_split_sizes}"
                         )
-                assert param_name in ("q_b_proj", "kv_b_proj", "o_proj"), (
-                    f"Unsupported MLA param name: {param_name}"
-                )
+                assert param_name in (
+                    "q_b_proj",
+                    "kv_a_proj",
+                    "kv_b_proj",
+                    "o_proj",
+                ), f"Unsupported MLA param name: {param_name}"
                 orthogonal_update = Muon._ortho_mla_per_head(
                     matrix_2d_global,
                     head_num,
                     ortho_fn,
                     0 if param_name == "o_proj" else 1,
+                    head_split_sizes,
                 )
             else:
                 # Standard 2D update: entire matrix as one Newton-Schulz call.
@@ -816,6 +829,9 @@ class Muon(Optimizer):
 
         if self._grad_clip is not None:
             params_grads = self._grad_clip(params_grads)
+
+        # apply for zcc
+        self._maybe_refuse()
 
         group = self._default_dict
         lr = self._learning_rate
